@@ -19,6 +19,11 @@ pub struct ToolCall {
     pub name: String,
     /// JSON 字符串参数（协议原样透传）
     pub arguments: String,
+    /// 端点挂在调用上的私货，原样带回。Gemini 3 在每个 function call 上给一个
+    /// `extra_content.google.thought_signature`，同一回合把结果送回去时**必须**
+    /// 原样附上，否则 400「Function call is missing a thought_signature」；上一回合
+    /// 的可以不带。内容不解读，不是对象就当没有。
+    pub extra_content: Option<serde_json::Value>,
 }
 
 /// 工具对话的一个 assistant 回合：文本与工具调用至少其一。
@@ -38,20 +43,50 @@ impl AssistantTurn {
             msg["tool_calls"] = json!(self
                 .tool_calls
                 .iter()
-                .map(|c| json!({
-                    "id": c.id,
-                    "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
-                }))
+                .map(|c| {
+                    let mut call = json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": { "name": c.name, "arguments": c.arguments },
+                    });
+                    if let Some(extra) = &c.extra_content {
+                        call["extra_content"] = extra.clone();
+                    }
+                    call
+                })
                 .collect::<Vec<_>>());
         }
         msg
     }
 }
 
+/// 一段 tool_call 增量归到哪个调用。写了 `index` 的听它的；没写的，带着 `id`
+/// 就是一个新调用，什么都不带就是上一个调用的续篇。
+///
+/// **不写 `index` 的端点把并行调用也不编号。** Gemini 的 OpenAI 兼容端点一个
+/// 调用一块，块上没有 `index`、有 `id`、参数一次给全；两个并行调用都按 0 归并，
+/// 名字就拼成了 `find_entitiessearch_chunks`，于是「未知工具」整轮作废。续篇的
+/// 判据是没有 `id`：OpenAI 的续篇只带参数碎片，开头那块才带 `id`
+fn tool_call_slot(delta: &serde_json::Value, seen: usize) -> usize {
+    if let Some(index) = delta["index"].as_u64() {
+        return index as usize;
+    }
+    let starts_a_call = delta["id"].as_str().is_some_and(|id| !id.is_empty());
+    if starts_a_call || seen == 0 {
+        seen
+    } else {
+        seen - 1
+    }
+}
+
 /// 工具结果消息（role=tool）。
 pub fn tool_result_message(tool_call_id: &str, content: &str) -> serde_json::Value {
     json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
+}
+
+/// 一条工具调用上端点挂的 `extra_content`：是对象才算，别的形状不猜。
+fn extra_content_of(call: &serde_json::Value) -> Option<serde_json::Value> {
+    call.get("extra_content").filter(|v| v.is_object()).cloned()
 }
 
 /// 带工具的流式回合事件。
@@ -842,6 +877,7 @@ impl LlmClient {
                                 .as_str()
                                 .unwrap_or("{}")
                                 .to_string(),
+                            extra_content: extra_content_of(c),
                         })
                     })
                     .collect()
@@ -922,15 +958,19 @@ impl LlmClient {
                         }
                         if let Some(tcs) = delta["tool_calls"].as_array() {
                             for tc in tcs {
-                                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                                let idx = tool_call_slot(tc, calls.len());
                                 while calls.len() <= idx {
                                     calls.push(ToolCall {
                                         id: String::new(),
                                         name: String::new(),
                                         arguments: String::new(),
+                                        extra_content: None,
                                     });
                                 }
                                 let slot = &mut calls[idx];
+                                if let Some(extra) = extra_content_of(tc) {
+                                    slot.extra_content = Some(extra);
+                                }
                                 if let Some(id) = tc["id"].as_str() {
                                     slot.id.push_str(id);
                                 }
@@ -2927,5 +2967,138 @@ data: [DONE]
         .await
         .unwrap();
         assert_eq!(out, vec![vec![1.0, 10.0], vec![2.0, 20.0]]);
+    }
+
+    /// Gemini 3 的形状：tool_call 不带 `index`，带 `extra_content.google.thought_signature`，
+    /// finish_reason 说 `stop`。两种传输都要把 `extra_content` 留住，回灌时原样带回
+    #[tokio::test]
+    async fn a_tool_call_keeps_its_extra_content_in_both_transports() {
+        use futures_util::TryStreamExt;
+        let extra = json!({"google": {"thought_signature": "Eq0CCqoC"}});
+        let call = json!({
+            "id": "call_170866", "type": "function",
+            "function": {"name": "search_kb", "arguments": "{\"query\":\"lore\"}"},
+            "extra_content": extra
+        });
+        let body = json!({"choices":[{"message":{"role":"assistant","tool_calls":[call]},"finish_reason":"stop"}]})
+            .to_string();
+        let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+        let turn = client_at(addr)
+            .chat_tools_with(&[], None, None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(turn.tool_calls[0].extra_content, Some(extra.clone()));
+        assert_eq!(turn.to_message()["tool_calls"][0]["extra_content"], extra);
+
+        let frame =
+            json!({"choices":[{"delta":{"role":"assistant","tool_calls":[call]},"index":0}]});
+        let done =
+            json!({"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}]});
+        let sse = format!("data: {frame}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected one completed turn: {items:?}");
+        };
+        assert_eq!(turn.tool_calls[0].extra_content, Some(extra.clone()));
+        assert_eq!(turn.to_message()["tool_calls"][0]["extra_content"], extra);
+    }
+
+    /// 没有 `extra_content`、或它不是对象的调用，回灌时也不长出这个键
+    #[tokio::test]
+    async fn a_tool_call_without_extra_content_echoes_none() {
+        for call in [
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}),
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}, "extra_content": null}),
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}, "extra_content": "sig"}),
+        ] {
+            let body = json!({"choices":[{"message":{"role":"assistant","tool_calls":[call]},"finish_reason":"tool_calls"}]})
+                .to_string();
+            let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+            let turn = client_at(addr)
+                .chat_tools_with(&[], None, None)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(turn.tool_calls[0].extra_content, None, "{call}");
+            assert!(
+                turn.to_message()["tool_calls"][0]
+                    .get("extra_content")
+                    .is_none(),
+                "{call}"
+            );
+        }
+    }
+
+    /// Gemini 的并行调用：一块一个，块上没有 `index`，各带自己的 `id`。两个调用，
+    /// 名字和参数各归各
+    #[tokio::test]
+    async fn parallel_tool_calls_without_an_index_stay_separate() {
+        use futures_util::TryStreamExt;
+        let first = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{
+            "function":{"arguments":"{\"name\":\"lore\"}","name":"find_entities"},
+            "id":"call_266956","type":"function"}]},"index":0}]});
+        let second = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{
+            "function":{"arguments":"{\"query\":\"what's next\"}","name":"search_chunks"},
+            "id":"call_266959","type":"function"}]},"index":0}]});
+        let done =
+            json!({"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}]});
+        let sse = format!("data: {first}\n\ndata: {second}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected one completed turn: {items:?}");
+        };
+        let calls: Vec<(&str, &str, &str)> = turn
+            .tool_calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("call_266956", "find_entities", "{\"name\":\"lore\"}"),
+                (
+                    "call_266959",
+                    "search_chunks",
+                    "{\"query\":\"what's next\"}"
+                ),
+            ]
+        );
+    }
+
+    /// 没有 `index` 也没有 `id` 的增量是上一个调用的续篇：参数碎片接在后面
+    #[tokio::test]
+    async fn an_unindexed_delta_without_an_id_continues_the_last_call() {
+        use futures_util::TryStreamExt;
+        let head = json!({"choices":[{"delta":{"tool_calls":[{
+            "id":"call_1","function":{"name":"lookup","arguments":"{\"name\":"}}]}}]});
+        let tail = json!({"choices":[{"delta":{"tool_calls":[{
+            "function":{"arguments":"\"Acme\"}"}}]}}]});
+        let done = json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]});
+        let sse = format!("data: {head}\n\ndata: {tail}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected one completed turn: {items:?}");
+        };
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].arguments, "{\"name\":\"Acme\"}");
     }
 }
