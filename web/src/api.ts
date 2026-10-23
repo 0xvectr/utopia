@@ -1196,8 +1196,9 @@ export interface OntologyRegressionCase {
   id: string;
   kb_id: string;
   statement_id: string;
-  expected_property_id: string;
-  expected_direction: "forward" | "reverse";
+  expected_binding: "bound" | "none";
+  expected_property_id: string | null;
+  expected_direction: "forward" | "reverse" | null;
   created_by: string | null;
   created_at: string;
   origin: "adoption" | "person";
@@ -1205,6 +1206,7 @@ export interface OntologyRegressionCase {
   last_result: {
     passed: boolean;
     human_bound: boolean;
+    conflict?: "human_binding" | null;
     actual_property_id: string | null;
     actual_direction: "forward" | "reverse" | null;
     status: "bound" | "none" | "undecided";
@@ -1216,8 +1218,8 @@ export interface OntologyRegressionCase {
   object_id: string | null;
   object_label: string | null;
   object_value: Record<string, unknown> | null;
-  expected_property_label: string;
-  expected_property_key: string;
+  expected_property_label: string | null;
+  expected_property_key: string | null;
   actual_property_label: string | null;
   actual_property_key: string | null;
   created_by_label: string | null;
@@ -2268,11 +2270,15 @@ export const api = {
     ),
   addOntologyRegression: (
     kbId: string,
-    body: {
-      statement_id: string;
+    body: { statement_id: string } & ({
+      expected_binding?: "bound";
       relation_type_id: string;
       direction: "forward" | "reverse";
-    },
+    } | {
+      expected_binding: "none";
+      relation_type_id?: null;
+      direction?: null;
+    }),
   ) =>
     request<{ id: string }>(`/api/v1/kbs/${kbId}/ontology/regressions`, {
       method: "POST",
