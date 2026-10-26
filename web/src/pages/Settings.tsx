@@ -39,7 +39,8 @@ import { SsoAdmin } from "./Sso";
  * 全得靠猜。
  *
  * 三条规矩，显示层只管最后一条，前两条在调用处保证：
- * 1. 改任何一格、按任何一次保存，旧结论（测试结果、Saved、报错）全部过期；
+ * 1. 改任何一格、按任何一次保存，旧的 Saved、报错全部过期；测试结果只过期改了的那张卡的
+ *    （见 `cardsOf`），别的卡配置没动，测出的结论还作数（#1424）；
  * 2. 一张卡一个测试（#1424）：测的、"Testing…"、测出的结论都只属于按下的那张卡；
  * 3. 新测到的结果（含测挂了）盖掉旧保存态——刚按了"测试"，卡上就该说测试的事。
  *
@@ -53,6 +54,15 @@ export type ModelCardStatus =
   | { kind: "unsaved" }
   | { kind: "saved" }
   | { kind: "idle" };
+
+export type ModelCard = "chat" | "embed" | "ocr" | "transcribe";
+/** 改了这几格，是哪几张卡的配置变了。字段名的前缀就是卡：chat_ / embed_ / ocr_ / transcribe_；
+ *  预设一次填对话与嵌入两张卡的格，两张都算（#1424） */
+export function cardsOf(fields: readonly string[]): ModelCard[] {
+  return (["chat", "embed", "ocr", "transcribe"] as const).filter((c) =>
+    fields.some((f) => f.startsWith(`${c}_`)),
+  );
+}
 
 /** 对话卡的测试结论：三种请求形状各一行，被拒的那一行带上端点的原话，于是一眼看得出
  *  是哪个参数不收（#1354）。旧服务端不回 `checks` 时退回一整句 */
@@ -1029,7 +1039,7 @@ export function Settings() {
   /* 四张卡各测各的，一张一个 mutation（#1424）：从前四张共用一次测试，按任意一张四套一起测，
      还得另记一个"是哪张按的"才能只让那一张转"Testing…"（#698）。分开以后测一张，
      别的卡上还作数的结论不受影响 */
-  const useCardTest = (card: "chat" | "embed" | "ocr" | "transcribe") =>
+  const useCardTest = (card: ModelCard) =>
     // eslint-disable-next-line react-hooks/rules-of-hooks
     useMutation({ mutationFn: () => api.testSettings(workspace!.id, card) });
   const tests = {
@@ -1038,7 +1048,9 @@ export function Settings() {
     ocr: useCardTest("ocr"),
     transcribe: useCardTest("transcribe"),
   };
-  const resetTests = () => Object.values(tests).forEach((t) => t.reset());
+  /* 改了哪几格，就只让那几张卡的测试结论过期 */
+  const expireTests = (fields: readonly string[]) =>
+    cardsOf(fields).forEach((c) => tests[c].reset());
   /* 两张卡各自有没有改过、还没保存的格子。测试只测已保存的配置，所以有修改的那张卡
      不让测，备注改说「先保存」；保存成功才清掉（#698） */
   const [dirty, setDirty] = useState({
@@ -1060,9 +1072,9 @@ export function Settings() {
 
   const set =
     (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) => {
-      /* 改一格，旧结论全部过期：测试结果、Saved、报错说的都是改之前的那份配置（#698）。
-         测的永远是已存盘的那份，所以表单一动，卡上就不该再贴任何旧话 */
-      resetTests();
+      /* 改一格，旧结论过期：Saved、报错说的都是改之前的那份配置（#698）。测的永远是
+         已存盘的那份，这张卡的测试结果也一起过期；别的卡没动，测出的还作数（#1424） */
+      expireTests([k]);
       resetSaves();
       // 字段名的前缀就是卡：chat_ / embed_ / ocr_ / transcribe_
       setDirty((d) => ({ ...d, [k.split("_")[0]]: true }));
@@ -1180,16 +1192,16 @@ export function Settings() {
                   key={name}
                   onClick={() => {
                     /* 预设只是批量填格，和手输一样让旧结论过期 */
-                    resetTests();
-                    resetSaves();
-                    setDirty((d) => ({ ...d, chat: true, embed: true }));
-                    setForm({
-                      ...form,
+                    const filled = {
                       chat_base_url: p.chat,
                       chat_model: p.chatModel,
                       embed_base_url: p.embed,
                       embed_model: p.embedModel,
-                    });
+                    };
+                    expireTests(Object.keys(filled));
+                    resetSaves();
+                    setDirty((d) => ({ ...d, chat: true, embed: true }));
+                    setForm({ ...form, ...filled });
                   }}
                 >
                   {name}
@@ -1212,8 +1224,8 @@ export function Settings() {
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      /* 存盘改了服务端，旧测试结论说的是上一版配置，一起过期 */
-                      resetTests();
+                      /* 存盘改了服务端，这张卡的旧测试结论说的是上一版配置，一起过期 */
+                      tests.chat.reset();
                       saveChat.mutate(
                         withSaved({
                           chat_base_url: form.chat_base_url,
@@ -1308,8 +1320,8 @@ export function Settings() {
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      /* 存盘改了服务端，旧测试结论说的是上一版配置，一起过期 */
-                      resetTests();
+                      /* 存盘改了服务端，这张卡的旧测试结论说的是上一版配置，一起过期 */
+                      tests.embed.reset();
                       saveEmbed.mutate(
                         withSaved({
                           embed_base_url: form.embed_base_url,
@@ -1385,7 +1397,7 @@ export function Settings() {
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      resetTests();
+                      tests.ocr.reset();
                       saveOcr.mutate();
                     }}
                     disabled={saveOcr.isPending}
@@ -1406,7 +1418,7 @@ export function Settings() {
                     value={form.ocr_provider}
                     onChange={(v) => {
                       if (v === form.ocr_provider) return;
-                      resetTests();
+                      tests.ocr.reset();
                       resetSaves();
                       setDirty((d) => ({ ...d, ocr: true }));
                       setForm({ ...form, ocr_provider: v, ocr_base_url: "", ocr_api_key: "", ocr_backend: "", ocr_model: "" });
@@ -1482,7 +1494,7 @@ export function Settings() {
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      resetTests();
+                      tests.transcribe.reset();
                       saveTranscribe.mutate();
                     }}
                     disabled={saveTranscribe.isPending}

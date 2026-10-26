@@ -339,7 +339,8 @@ pub struct TestQuery {
 }
 
 /// 连通性测试：对话按任务的三种请求形状各试一次（见 [`chat_checks`]）；embedding 试算一条并
-/// 返回维度；版面识别服务问一声健康。
+/// 返回维度；版面识别服务问一声健康。带 `?card=`（[`ModelCard`]）只测那一张卡，回来的也只有
+/// 那一项；不带就四张都测（#1424）。
 pub async fn test(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
