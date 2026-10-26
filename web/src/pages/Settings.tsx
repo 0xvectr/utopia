@@ -38,10 +38,9 @@ import { SsoAdmin } from "./Sso";
  * 聊天卡的报错却是危险色。于是"Saved" 说的是哪次操作、这次测的又是哪张卡，
  * 全得靠猜。
  *
- * 三条规矩，显示层只管最后一条，前两条在调用处用 reset 保证：
+ * 三条规矩，显示层只管最后一条，前两条在调用处保证：
  * 1. 改任何一格、按任何一次保存，旧结论（测试结果、Saved、报错）全部过期；
- * 2. "Testing…" 只亮在按下的那张卡上（`testCard`），因为测的虽然是两套，
- *    人按的是这一张；
+ * 2. 一张卡一个测试（#1424）：测的、"Testing…"、测出的结论都只属于按下的那张卡；
  * 3. 新测到的结果（含测挂了）盖掉旧保存态——刚按了"测试"，卡上就该说测试的事。
  *
  * 传纯数据、回纯结论（含用哪个色调），字串仍在调用处配 i18n；
@@ -1027,16 +1026,19 @@ export function Settings() {
     saveTranscribe.reset();
   };
 
-  const test = useMutation({
-    mutationFn: () => api.testSettings(workspace!.id),
-    // 测完谁按的就清掉：pending 的字样只在飞行中属于那张卡
-    onSettled: () => setTestCard(null),
-  });
-  /* 哪张卡按下的"测试"。测一次是两套一起测（一个接口），结果各自回卡；
-     但两个按钮共用这一个 mutation，从前按任意一张两张一起转"Testing…"（#698） */
-  const [testCard, setTestCard] = useState<"chat" | "embed" | "ocr" | "transcribe" | null>(
-    null,
-  );
+  /* 四张卡各测各的，一张一个 mutation（#1424）：从前四张共用一次测试，按任意一张四套一起测，
+     还得另记一个"是哪张按的"才能只让那一张转"Testing…"（#698）。分开以后测一张，
+     别的卡上还作数的结论不受影响 */
+  const useCardTest = (card: "chat" | "embed" | "ocr" | "transcribe") =>
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    useMutation({ mutationFn: () => api.testSettings(workspace!.id, card) });
+  const tests = {
+    chat: useCardTest("chat"),
+    embed: useCardTest("embed"),
+    ocr: useCardTest("ocr"),
+    transcribe: useCardTest("transcribe"),
+  };
+  const resetTests = () => Object.values(tests).forEach((t) => t.reset());
   /* 两张卡各自有没有改过、还没保存的格子。测试只测已保存的配置，所以有修改的那张卡
      不让测，备注改说「先保存」；保存成功才清掉（#698） */
   const [dirty, setDirty] = useState({
@@ -1045,11 +1047,12 @@ export function Settings() {
     ocr: false,
     transcribe: false,
   });
-  /* 开测：上一轮的结论（两边卡的 Saved/报错、上一轮测试结果）全部让位给这一轮 */
-  const startTest = () => {
-    test.reset();
-    resetSaves();
-    test.mutate();
+  /* 开测：这张卡上一轮的结论（Saved/报错、上一轮测试结果）让位给这一轮；别的卡没测，不动 */
+  const saves = { chat: saveChat, embed: saveEmbed, ocr: saveOcr, transcribe: saveTranscribe };
+  const startTest = (card: keyof typeof tests) => {
+    tests[card].reset();
+    saves[card].reset();
+    tests[card].mutate();
   };
 
   if (!workspace)
@@ -1059,7 +1062,7 @@ export function Settings() {
     (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) => {
       /* 改一格，旧结论全部过期：测试结果、Saved、报错说的都是改之前的那份配置（#698）。
          测的永远是已存盘的那份，所以表单一动，卡上就不该再贴任何旧话 */
-      test.reset();
+      resetTests();
       resetSaves();
       // 字段名的前缀就是卡：chat_ / embed_ / ocr_ / transcribe_
       setDirty((d) => ({ ...d, [k.split("_")[0]]: true }));
@@ -1070,15 +1073,16 @@ export function Settings() {
 
   /* 两张卡的备注：新测到的盖掉旧保存态，测挂了（连接口都没通）也不再
      悄悄退回"Saved"或空白——从前请求本身失败时卡上什么都不说（#698） */
-  const testTransportError = test.error ? (test.error as Error).message : null;
+  const testTransportError = (card: keyof typeof tests) =>
+    tests[card].error ? (tests[card].error as Error).message : null;
   const chatStatus = modelCardStatus(
-    test.data
+    tests.chat.data?.chat
       ? {
-          ok: test.data.chat.ok,
-          message: chatTestMessage(test.data.chat),
+          ok: tests.chat.data.chat.ok,
+          message: chatTestMessage(tests.chat.data.chat),
         }
       : null,
-    testTransportError,
+    testTransportError("chat"),
     {
       error: saveChat.error ? (saveChat.error as Error).message : null,
       saved: saveChat.isSuccess,
@@ -1086,15 +1090,15 @@ export function Settings() {
     },
   );
   const embedStatus = modelCardStatus(
-    test.data
+    tests.embed.data?.embed
       ? {
-          ok: test.data.embed.ok,
-          message: test.data.embed.ok
-            ? S.settings.okDim(test.data.embed.dim ?? 0)
-            : (test.data.embed.error ?? ""),
+          ok: tests.embed.data.embed.ok,
+          message: tests.embed.data.embed.ok
+            ? S.settings.okDim(tests.embed.data.embed.dim ?? 0)
+            : (tests.embed.data.embed.error ?? ""),
         }
       : null,
-    testTransportError,
+    testTransportError("embed"),
     {
       error: saveEmbed.error ? (saveEmbed.error as Error).message : null,
       saved: saveEmbed.isSuccess,
@@ -1102,15 +1106,15 @@ export function Settings() {
     },
   );
   const ocrStatus = modelCardStatus(
-    test.data?.ocr
+    tests.ocr.data?.ocr
       ? {
-          ok: test.data.ocr.ok,
-          message: test.data.ocr.ok
-            ? S.settings.okVersion(test.data.ocr.version ?? "?")
-            : (test.data.ocr.error ?? ""),
+          ok: tests.ocr.data.ocr.ok,
+          message: tests.ocr.data.ocr.ok
+            ? S.settings.okVersion(tests.ocr.data.ocr.version ?? "?")
+            : (tests.ocr.data.ocr.error ?? ""),
         }
       : null,
-    testTransportError,
+    testTransportError("ocr"),
     {
       error: saveOcr.error ? (saveOcr.error as Error).message : null,
       saved: saveOcr.isSuccess,
@@ -1118,15 +1122,15 @@ export function Settings() {
     },
   );
   const transcribeStatus = modelCardStatus(
-    test.data?.transcribe
+    tests.transcribe.data?.transcribe
       ? {
-          ok: test.data.transcribe.ok,
-          message: test.data.transcribe.ok
+          ok: tests.transcribe.data.transcribe.ok,
+          message: tests.transcribe.data.transcribe.ok
             ? S.settings.okReachable
-            : (test.data.transcribe.error ?? ""),
+            : (tests.transcribe.data.transcribe.error ?? ""),
         }
       : null,
-    testTransportError,
+    testTransportError("transcribe"),
     {
       error: saveTranscribe.error ? (saveTranscribe.error as Error).message : null,
       saved: saveTranscribe.isSuccess,
@@ -1176,7 +1180,7 @@ export function Settings() {
                   key={name}
                   onClick={() => {
                     /* 预设只是批量填格，和手输一样让旧结论过期 */
-                    test.reset();
+                    resetTests();
                     resetSaves();
                     setDirty((d) => ({ ...d, chat: true, embed: true }));
                     setForm({
@@ -1198,21 +1202,18 @@ export function Settings() {
               note={cardNote(chatStatus)}
               action={
                 <>
-                  {/* 试一次连的是两套模型（一个接口），结果各自回到各自那张卡；
-                      但"Testing…"只亮在按下的这一张上（`testCard`） */}
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      setTestCard("chat");
-                      startTest();
+                      startTest("chat");
                     }}
-                    disabled={test.isPending || dirty.chat}
+                    disabled={tests.chat.isPending || dirty.chat}
                   >
-                    {testCard === "chat" && test.isPending ? S.settings.testing : S.settings.test}
+                    {tests.chat.isPending ? S.settings.testing : S.settings.test}
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       /* 存盘改了服务端，旧测试结论说的是上一版配置，一起过期 */
-                      test.reset();
+                      resetTests();
                       saveChat.mutate(
                         withSaved({
                           chat_base_url: form.chat_base_url,
@@ -1299,17 +1300,16 @@ export function Settings() {
                 <>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      setTestCard("embed");
-                      startTest();
+                      startTest("embed");
                     }}
-                    disabled={test.isPending || dirty.embed}
+                    disabled={tests.embed.isPending || dirty.embed}
                   >
-                    {testCard === "embed" && test.isPending ? S.settings.testing : S.settings.test}
+                    {tests.embed.isPending ? S.settings.testing : S.settings.test}
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       /* 存盘改了服务端，旧测试结论说的是上一版配置，一起过期 */
-                      test.reset();
+                      resetTests();
                       saveEmbed.mutate(
                         withSaved({
                           embed_base_url: form.embed_base_url,
@@ -1377,16 +1377,15 @@ export function Settings() {
                 <>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      setTestCard("ocr");
-                      startTest();
+                      startTest("ocr");
                     }}
-                    disabled={test.isPending || dirty.ocr}
+                    disabled={tests.ocr.isPending || dirty.ocr}
                   >
-                    {testCard === "ocr" && test.isPending ? S.settings.testing : S.settings.test}
+                    {tests.ocr.isPending ? S.settings.testing : S.settings.test}
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      test.reset();
+                      resetTests();
                       saveOcr.mutate();
                     }}
                     disabled={saveOcr.isPending}
@@ -1407,7 +1406,7 @@ export function Settings() {
                     value={form.ocr_provider}
                     onChange={(v) => {
                       if (v === form.ocr_provider) return;
-                      test.reset();
+                      resetTests();
                       resetSaves();
                       setDirty((d) => ({ ...d, ocr: true }));
                       setForm({ ...form, ocr_provider: v, ocr_base_url: "", ocr_api_key: "", ocr_backend: "", ocr_model: "" });
@@ -1475,18 +1474,15 @@ export function Settings() {
                 <>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      setTestCard("transcribe");
-                      startTest();
+                      startTest("transcribe");
                     }}
-                    disabled={test.isPending || dirty.transcribe}
+                    disabled={tests.transcribe.isPending || dirty.transcribe}
                   >
-                    {testCard === "transcribe" && test.isPending
-                      ? S.settings.testing
-                      : S.settings.test}
+                    {tests.transcribe.isPending ? S.settings.testing : S.settings.test}
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
-                      test.reset();
+                      resetTests();
                       saveTranscribe.mutate();
                     }}
                     disabled={saveTranscribe.isPending}
